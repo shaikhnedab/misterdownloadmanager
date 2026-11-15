@@ -1,0 +1,91 @@
+# Builds MDM's Windows x64 downloads into target/dist/, as the Release workflow does, without the
+# other processors or the Linux, macOS, extension and publish jobs. Run by hand on any branch.
+name: Windows x64 build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-x64:
+    name: windows-x64
+    runs-on: windows-latest
+    # A cold build takes about 45 minutes; a stuck runner is cut off instead of holding the job.
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Toolchain
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustup target add x86_64-pc-windows-msvc
+
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: release-${{ runner.os }}-x86_64-pc-windows-msvc-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: release-${{ runner.os }}-x86_64-pc-windows-msvc-cargo-
+
+      # BoringSSL, under the browser-like connection (#668), and AWS-LC are built with NASM on
+      # x64 Windows; the runner has CMake and LLVM's libclang already.
+      - name: NASM
+        shell: pwsh
+        run: |
+          choco install nasm --version 2.16.3 --no-progress -y
+          "C:\Program Files\NASM" >> $env:GITHUB_PATH
+
+      - name: Inno Setup
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) {
+            choco install innosetup --no-progress -y
+          }
+
+      - name: Code-signing certificate
+        id: cert
+        shell: pwsh
+        env:
+          PFX: ${{ secrets.CODESIGN_PFX_BASE64 }}
+          PASSWORD: ${{ secrets.CODESIGN_PASSWORD }}
+        run: |
+          if (-not $env:PFX) { "No certificate: building unsigned."; exit 0 }
+          $pfx = Join-Path $env:RUNNER_TEMP "codesign.pfx"
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:PFX))
+          $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          "command=`"$($signtool.FullName)`" sign /fd sha256 /tr http://timestamp.digicert.com /td sha256 /f `"$pfx`" /p `"$env:PASSWORD`" `$f" >> $env:GITHUB_OUTPUT
+
+      - name: Installer and portable zip
+        shell: pwsh
+        env:
+          MDM_SIGN_COMMAND: ${{ steps.cert.outputs.command }}
+        run: ./tools/installer/build.ps1 -Arch x64
+
+      # The programs on the machine that built them: for x64, and a download works.
+      - name: Smoke test
+        run: python tools/installer/smoke.py target/x86_64-pc-windows-msvc/release x64
+
+      # Crash reports: the release's symbols (no download includes the .pdb files themselves).
+      - name: Symbols
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $v = [regex]::Match((Get-Content Cargo.toml -Raw), '(?m)^version\s*=\s*"([^"]+)"').Groups[1].Value
+          $exes = "misterdownloadmanager", "misterdownloadmanager-nmhost", "misterdownloadmanager-cli", "misterdownloadmanager-mcp" |
+            ForEach-Object { "target/x86_64-pc-windows-msvc/release/$_.exe" }
+          python tools/installer/symbols.py windows-x64 $v target/dist @exes
+          if ($LASTEXITCODE) { throw "symbols failed" }
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows
+          path: target/dist/*
+          retention-days: 7
